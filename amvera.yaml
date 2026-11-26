@@ -1,0 +1,12 @@
+meta:
+  environment: python
+  toolchain:
+    name: pip
+    version: '3.13'
+build:
+  requirementsPath: requirements.txt
+  useCache: true
+run:
+  persistenceMount: /data
+  command: uvicorn app:create_app --factory --host 0.0.0.0 --port 8000 --workers 1 --no-proxy-headers --no-access-log
+  containerPort: 8000
