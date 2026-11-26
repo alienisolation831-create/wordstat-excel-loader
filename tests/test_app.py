@@ -64,6 +64,7 @@ class Tests(unittest.TestCase):
         init(self.cfg)
         with db(self.cfg) as c:
             self.assertEqual(c.execute('SELECT status FROM jobs WHERE id=?',(j,)).fetchone()[0],'queued');self.assertEqual(c.execute('SELECT status FROM items WHERE job=? AND n=0',(j,)).fetchone()[0],'error');self.assertEqual(c.execute('SELECT COUNT(*) FROM calls').fetchone()[0],1)
+        self.assertEqual(self.client.get('/api/jobs').status_code,401);self.login()
         self.assertTrue(process_one(self.cfg));self.assertEqual(self.client.get('/api/jobs').json()['jobs'][0]['status'],'done')
     def test_secure_cookie_and_security_headers(self):
         with patch.dict(os.environ,{'APP_ORIGIN':'https://example.test','COOKIE_SECURE':'true'}):
@@ -81,4 +82,54 @@ class Tests(unittest.TestCase):
         real=httpx.Client
         with patch('app.httpx.Client',side_effect=lambda **kw:real(transport=httpx.MockTransport(handler),**kw)):
             self.assertEqual(api_result(self.cfg,'test',{'start':'2026-09-01','end':'2026-09-30','period':'month','device':'DEVICE_ALL','regions':[]},False),[{'date':'2026-09-01','count':123}]);self.assertEqual(len(calls),1)
+    def test_password_change_revokes_sessions(self):
+        self.login();token=self.client.cookies.get('wordstat_session')
+        with patch.dict(os.environ,{'APP_PASSWORD':'new-unique-test-password-456'}):
+            newapp=create_app(Config(),False)
+            with TestClient(newapp,base_url=ORIGIN) as other:
+                other.cookies.set('wordstat_session',token)
+                self.assertEqual(other.get('/api/jobs').status_code,401)
+    def test_invalid_unicode(self):
+        r=self.client.post('/api/login',content=b'{"password":"\\ud800"}',headers=self.headers)
+        self.assertEqual(r.status_code,400)
+    def test_peer_isolation_and_no_header_spoofing(self):
+        with TestClient(self.app,base_url=ORIGIN,client=('192.0.2.1',12345)) as attacker:
+            for _ in range(5):self.assertEqual(attacker.post('/api/login',json={'password':'bad'},headers=self.headers).status_code,401)
+            self.assertEqual(attacker.post('/api/login',json={'password':PW},headers={**self.headers,'X-Forwarded-For':'192.0.2.2'}).status_code,429)
+        with TestClient(self.app,base_url=ORIGIN,client=('192.0.2.2',12345)) as owner:
+            self.assertEqual(owner.post('/api/login',json={'password':PW},headers=self.headers).status_code,200)
+    def test_budget_caps_persist(self):
+        with patch.dict(os.environ,{'DEMO_MODE':'false','YANDEX_API_KEY':'test-placeholder','YANDEX_FOLDER_ID':'test-folder'}):
+            with self.assertRaises(ValueError):Config()
+            with patch.dict(os.environ,{'API_MAX_COST_KOPECKS':'25','API_DAILY_BUDGET_KOPECKS':'50'}):
+                cfg=Config();self.assertEqual(cfg.day,2)
+                with db(cfg) as c:
+                    c.execute('BEGIN IMMEDIATE');now=time.time();self.assertTrue(reserve(cfg,c,now));self.assertTrue(reserve(cfg,c,now));self.assertFalse(reserve(cfg,c,now+3601))
+    def test_static_allowlist_and_headers(self):
+        self.assertEqual(self.client.get('/static/app.js').status_code,200)
+        self.assertEqual(self.client.get('/static/not-allowed').status_code,404)
+        r=self.client.get('/',headers={'Host':'invalid.example'});self.assertEqual(r.status_code,400);self.assertEqual(r.headers['cache-control'],'no-store')
+    def test_concurrency_limit(self):
+        import asyncio
+        async def exercise():
+            self.cfg.concurrent=2
+            self.app.middleware_stack=None
+            stack=self.app.build_middleware_stack()
+            gate=asyncio.Event();entered=asyncio.Event();count=0
+            middleware=stack.app
+            original=middleware.app
+            async def hold(scope,receive,send):
+                nonlocal count
+                count+=1
+                if count==2:entered.set()
+                await gate.wait()
+                await original(scope,receive,send)
+            middleware.app=hold
+            import httpx
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stack),base_url=ORIGIN) as c:
+                tasks=[asyncio.create_task(c.get('/')) for _ in range(2)]
+                await asyncio.wait_for(entered.wait(),2)
+                try:self.assertEqual((await c.get('/')).status_code,503)
+                finally:gate.set();await asyncio.gather(*tasks)
+        asyncio.run(exercise())
 if __name__=='__main__':unittest.main()

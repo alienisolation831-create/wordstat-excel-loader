@@ -8,5 +8,5 @@ build:
   useCache: true
 run:
   persistenceMount: /data
-  command: uvicorn app:create_app --factory --host 0.0.0.0 --port 8000 --workers 1 --no-proxy-headers --no-access-log
+  command: uvicorn app:create_app --factory --host 0.0.0.0 --port 8000 --workers 1 --no-proxy-headers --no-access-log --limit-concurrency 32 --timeout-keep-alive 5
   containerPort: 8000

@@ -1,4 +1,4 @@
-import os, secrets, hashlib, hmac, sqlite3, time, json, re, io, zipfile, threading, calendar, logging
+import asyncio, os, secrets, hashlib, hmac, sqlite3, time, json, re, io, zipfile, threading, calendar, logging
 from datetime import date, timedelta
 from pathlib import Path
 from contextlib import contextmanager, asynccontextmanager
@@ -8,8 +8,7 @@ from openpyxl import load_workbook, Workbook
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, HTMLResponse, Response, FileResponse
-from starlette.routing import Route, Mount
-from starlette.staticfiles import StaticFiles
+from starlette.routing import Route
 from starlette.concurrency import run_in_threadpool
 
 BASE=Path(__file__).resolve().parent
@@ -49,6 +48,13 @@ class Config:
         self.hour=integer('MAX_REQUESTS_HOUR',100,1,10000)
         self.day=integer('MAX_REQUESTS_DAY',200,1,50000)
         self.run=integer('MAX_REQUESTS_RUN',500,1,MAX_ROWS)
+        self.concurrent=integer('MAX_HTTP_CONCURRENT',8,2,32)
+        self.cost=integer('API_MAX_COST_KOPECKS',0,0,1000000)
+        self.budget=integer('API_DAILY_BUDGET_KOPECKS',0,0,100000000)
+        if bool(self.cost)!=bool(self.budget) or (not self.demo and not self.cost): raise ValueError('Configure positive API_MAX_COST_KOPECKS and API_DAILY_BUDGET_KOPECKS for real mode')
+        if self.cost:
+            if self.budget<self.cost: raise ValueError('Daily budget below one request')
+            self.day=min(self.day,self.budget//self.cost)
         self.max_date=os.getenv('WORDSTAT_MAX_DATE','2026-10-07')
         if self.max_date: date.fromisoformat(self.max_date)
         self.data.mkdir(mode=0o700,parents=True,exist_ok=True)
@@ -67,11 +73,15 @@ def init(cfg):
         c.executescript('''PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS attempts(at REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS peer_attempts(peer TEXT NOT NULL, at REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS peer_attempts_at ON peer_attempts(at);
+        CREATE INDEX IF NOT EXISTS peer_attempts_peer ON peer_attempts(peer,at);
         CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, status TEXT NOT NULL, created REAL NOT NULL, params TEXT NOT NULL, demo INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS items(job TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE, n INTEGER NOT NULL, phrase TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', result TEXT, error TEXT, PRIMARY KEY(job,n));
         CREATE TABLE IF NOT EXISTS calls(at REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS calls_at ON calls(at);
         ''')
+        c.execute("DELETE FROM sessions")
         c.execute("UPDATE items SET status='error',error='Сервер перезапущен; результат неизвестен, повтор не выполнялся' WHERE status='running'")
         c.execute("UPDATE jobs SET status='queued' WHERE status='running'")
     os.chmod(cfg.db,0o600)
@@ -152,8 +162,9 @@ def api_result(cfg,phrase,p,demo):
     with httpx.Client(timeout=httpx.Timeout(30,connect=10),follow_redirects=False,trust_env=False) as client:
         with client.stream('POST',API,json=payload,headers={'Authorization':'Api-Key '+cfg.key}) as response:
             if response.status_code!=200: raise APIError(f'API HTTP {response.status_code}')
-            raw=bytearray()
+            raw=bytearray(); deadline=time.monotonic()+45
             for chunk in response.iter_bytes():
+                if time.monotonic()>deadline: raise APIError('API response deadline exceeded')
                 raw.extend(chunk)
                 if len(raw)>2*1024*1024: raise APIError('Ответ API слишком большой')
     try:
@@ -208,6 +219,7 @@ def create_app(cfg=None,run_worker=True):
         yield
         stop.set()
         if t: await run_in_threadpool(t.join,35)
+    login_lock=asyncio.Lock()
     def answer(data,status=200): return JSONResponse(data,status_code=status)
     def session(r):
         token=r.cookies.get(COOKIE,'')
@@ -220,24 +232,46 @@ def create_app(cfg=None,run_worker=True):
         return None
     async def body(r,limit):
         data=bytearray()
-        async for chunk in r.stream():
-            data.extend(chunk)
-            if len(data)>limit: raise ValueError('Размер запроса превышен')
+        try:
+            async with asyncio.timeout(15):
+                async for chunk in r.stream():
+                    if len(data)+len(chunk)>limit: raise ValueError('Размер запроса превышен')
+                    data.extend(chunk)
+        except TimeoutError: raise ValueError('Превышено время загрузки') from None
         return bytes(data)
     async def home(r): return FileResponse(BASE/'static'/'index.html',media_type='text/html')
+    async def asset(r):
+        name=r.path_params['name']
+        allowed={'app.js':'text/javascript','style.css':'text/css'}
+        if name not in allowed: return answer({'error':'Not found'},404)
+        return FileResponse(BASE/'static'/name,media_type=allowed[name])
     async def login(r):
         if r.headers.get('origin')!=cfg.origin: return answer({'error':'Недопустимый источник'},403)
         try:
             p=json.loads(await body(r,2048))['password'];
             if not isinstance(p,str) or len(p)>256: raise ValueError()
+            password_bytes=p.encode('utf-8')
         except Exception: return answer({'error':'Некорректный запрос'},400)
-        with db(cfg) as c:
-            c.execute('BEGIN IMMEDIATE'); now=time.time();c.execute('DELETE FROM attempts WHERE at<=?',(now-900,))
-            if c.execute('SELECT COUNT(*) FROM attempts').fetchone()[0]>=5: return answer({'error':'Слишком много попыток; повторите через 15 минут'},429)
-            if not hmac.compare_digest(hashlib.scrypt(p.encode(),salt=cfg.salt,n=2**15,r=8,p=3,maxmem=64*1024*1024),cfg.password_hash):
-                c.execute('INSERT INTO attempts VALUES(?)',(now,));return answer({'error':'Неверный пароль'},401)
-            c.execute('DELETE FROM attempts');c.execute('DELETE FROM sessions'); token=secrets.token_urlsafe(32); csrf=secrets.token_urlsafe(32)
-            c.execute('INSERT INTO sessions VALUES(?,?,?)',(digest(token),csrf,now+8*3600))
+        # The ASGI peer is used, not client-controlled forwarding headers.
+        peer=digest(r.client.host if r.client else 'unknown')
+        def attempt():
+            with db(cfg) as c:
+                c.execute('BEGIN IMMEDIATE'); now=time.time()
+                c.execute('DELETE FROM peer_attempts WHERE at<=?',(now-900,))
+                if c.execute('SELECT COUNT(*) FROM peer_attempts WHERE peer=?',(peer,)).fetchone()[0]>=5:
+                    return False,429
+                # Reserve before KDF to make concurrent attempts atomic.
+                c.execute('INSERT INTO peer_attempts VALUES(?,?)',(peer,now))
+            return hmac.compare_digest(hashlib.scrypt(password_bytes,salt=cfg.salt,n=2**15,r=8,p=3,maxmem=64*1024*1024),cfg.password_hash),401
+        # At most one memory-intensive KDF at a time; no unbounded queue.
+        if login_lock.locked(): return answer({'error':'Повторите попытку позже'},429)
+        async with login_lock:
+            ok,status=await run_in_threadpool(attempt)
+            if not ok: return answer({'error':'Слишком много попыток' if status==429 else 'Неверный пароль'},status)
+            with db(cfg) as c:
+                c.execute('BEGIN IMMEDIATE'); c.execute('DELETE FROM peer_attempts WHERE peer=?',(peer,)); c.execute('DELETE FROM sessions')
+                token=secrets.token_urlsafe(32); csrf=secrets.token_urlsafe(32)
+                c.execute('INSERT INTO sessions VALUES(?,?,?)',(digest(token),csrf,time.time()+8*3600))
         res=answer({'csrf':csrf,'demo':cfg.demo,'limit':cfg.run,'max_date':cfg.max_date});res.set_cookie(COOKIE,token,httponly=True,secure=cfg.secure,samesite='strict',max_age=28800,path='/');return res
     async def info(r):
         s=session(r)
@@ -258,6 +292,7 @@ def create_app(cfg=None,run_worker=True):
             if q.get('confirm')!='yes':raise ValueError('Подтвердите отправку запросов')
             items=await run_in_threadpool(phrases,await body(r,MAX_UPLOAD),q.get('sheet',''),int(q.get('col','1')),q.get('header')=='yes',cfg.run)
         except ValueError as e:return answer({'error':str(e)},400)
+        if (err:=auth(r,True)):return err
         with db(cfg) as c:
             c.execute('BEGIN IMMEDIATE')
             if c.execute("SELECT 1 FROM jobs WHERE status IN ('queued','running','waiting','paused')").fetchone():return answer({'error':'Сначала завершите или остановите текущую задачу'},409)
@@ -303,13 +338,26 @@ def create_app(cfg=None,run_worker=True):
         b=await run_in_threadpool(export,r.path_params['job'])
         if b is None:return answer({'error':'Не найдено'},404)
         return Response(b,media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',headers={'Content-Disposition':'attachment; filename="wordstat-results.xlsx"'})
-    app=Starlette(routes=[Route('/',home),Route('/api/login',login,methods=['POST']),Route('/api/info',info),Route('/api/logout',logout,methods=['POST']),Route('/api/preview',inspect,methods=['POST']),Route('/api/start',start,methods=['POST']),Route('/api/jobs',jobs),Route('/api/jobs/{job}/export',download),Route('/api/jobs/{job}/{action}',control,methods=['POST']),Mount('/static',StaticFiles(directory=BASE/'static'))],lifespan=lifespan,debug=False)
-    @app.middleware('http')
-    async def security(r,call_next):
-        if r.headers.get('host','').lower()!=urlsplit(cfg.origin).netloc.lower(): return answer({'error':'Invalid host'},400)
-        res=await call_next(r)
-        res.headers.update({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",'Permissions-Policy':'camera=(), microphone=(), geolocation=()'})
-        if cfg.secure:res.headers['Strict-Transport-Security']='max-age=31536000'
-        return res
+    app=Starlette(routes=[Route('/',home),Route('/api/login',login,methods=['POST']),Route('/api/info',info),Route('/api/logout',logout,methods=['POST']),Route('/api/preview',inspect,methods=['POST']),Route('/api/start',start,methods=['POST']),Route('/api/jobs',jobs),Route('/api/jobs/{job}/export',download),Route('/api/jobs/{job}/{action}',control,methods=['POST']),Route('/static/{name}',asset)],lifespan=lifespan,debug=False)
+    class SecurityMiddleware:
+        def __init__(self,app):
+            self.app=app; self.inflight=0
+        async def __call__(self,scope,receive,send):
+            if scope['type']!='http': return await self.app(scope,receive,send)
+            headers=[v for k,v in scope['headers'] if k.lower()==b'host']
+            async def secured_send(msg):
+                if msg['type']=='http.response.start':
+                    additions={'Cache-Control':'no-store','X-Content-Type-Options':'nosniff','X-Frame-Options':'DENY','Referrer-Policy':'no-referrer','Content-Security-Policy':"default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",'Permissions-Policy':'camera=(), microphone=(), geolocation=()'}
+                    if cfg.secure: additions['Strict-Transport-Security']='max-age=31536000'
+                    msg['headers']=[(k,v) for k,v in msg.get('headers',[]) if k.decode('latin1').lower() not in {h.lower() for h in additions}]+[(k.lower().encode(),v.encode()) for k,v in additions.items()]
+                await send(msg)
+            if len(headers)!=1 or headers[0].decode('latin1').lower()!=urlsplit(cfg.origin).netloc.lower():
+                return await answer({'error':'Invalid host'},400)(scope,receive,secured_send)
+            if self.inflight>=cfg.concurrent:
+                return await answer({'error':'Server busy'},503)(scope,receive,secured_send)
+            self.inflight+=1
+            try: await self.app(scope,receive,secured_send)
+            finally: self.inflight-=1
+    app.add_middleware(SecurityMiddleware)
     app.state.cfg=cfg
     return app
