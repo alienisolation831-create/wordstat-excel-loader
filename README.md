@@ -1,5 +1,76 @@
 # Wordstat Excel Loader
 
+[English](#english) | [Русский](#russian)
+
+<a id="english"></a>
+
+## English
+
+Wordstat Excel Loader is a self-hosted, single-user web application for collecting historical Yandex Wordstat search volumes from XLSX files. Synthetic DEMO mode is enabled by default. Real API requests require the owner's own credentials. Do not expose a running instance publicly without HTTPS, network protection and your own security audit.
+
+### Quick start (Docker, local)
+
+1. Copy `.env.example` to `.env`.
+2. Set `APP_PASSWORD` to a unique random password (16–256 characters). Never commit `.env`.
+3. Run `docker compose up --build -d` and open http://localhost:8000.
+4. Log in, upload `example.xlsx`, click the file validation button (Проверить файл), select the worksheet, column and date range, then confirm the job. Download the Excel results from the jobs section.
+
+DEMO data is synthetic and does not represent actual Yandex statistics. The application interface is currently in Russian.
+
+To run locally without Docker, use Python 3.13, create a virtual environment with `python -m venv .venv`, activate it and run `pip install -r requirements.txt`. Set the environment variables from the example manually (do not pass the password as a command-line argument), then run:
+
+```sh
+uvicorn app:create_app --factory --host 127.0.0.1 --port 8000 --workers 1 --no-access-log
+```
+
+### Live API
+
+Set `DEMO_MODE=false`, `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `API_MAX_COST_KOPECKS` and `API_DAILY_BUDGET_KOPECKS` in the server's secret configuration. The service account needs the `search-api.webSearch.user` role, and the key needs the `yc.search-api.execute` scope.
+
+The application uses one GetDynamics request per unique search phrase.
+
+- [Official Wordstat API documentation](https://aistudio.yandex.ru/ru/docs/search-api/operations/wordstat-getdynamics)
+- [Yandex Search API pricing](https://aistudio.yandex.ru/ru/docs/search-api/pricing)
+
+**Data availability:** as documented on November 27, 2026, statistics after October 7, 2026 were unavailable. `WORDSTAT_MAX_DATE=2026-10-07` is a protective setting; the operator can change or clear it once data availability is confirmed. Do not request partial months for monthly aggregation. Weeks start on Monday and end on Sunday. Missing data points are not replaced with zeroes; totals include only available points.
+
+### Server deployment (Amvera or VPS)
+
+- `amvera.yaml` is provided as an example configuration. Compatibility with the current Amvera runtime has not been verified. Attach persistent storage at `/data` and set `DATA_DIR=/data`.
+- Set `APP_ORIGIN=https://your-domain` and `COOKIE_SECURE=true`. Terminate TLS at a trusted reverse proxy that forwards the original Host header. Do not expose the backend port directly. Docker binds to loopback by default. Configure request-rate and body-size limits at the proxy and restrict access via VPN or IP allowlisting where possible.
+- Run exactly one process and one instance with SQLite. Do not scale horizontally. When a job is stopped, the current request may finish, but new requests are not started. After a restart, an unfinished request is marked as failed rather than automatically retried and potentially charged again; remaining work continues.
+- `MAX_REQUESTS_HOUR`, `MAX_REQUESTS_DAY` and `MAX_REQUESTS_RUN` limit request attempts. An estimated budget limit also applies. Configure budgets and quotas separately in Yandex Cloud, especially if the key is shared with other applications. API errors pause jobs; resuming does not automatically repeat the failed request.
+- Data is stored locally in SQLite. Delete completed jobs through the interface and protect the storage volume and backups. Deletion does not guarantee cryptographic erasure. Do not share the application password.
+- A new login invalidates the previous session. Five failed login attempts trigger a 15-minute block for the network address. Behind a reverse proxy without trusted client-address handling, all visitors may appear to have the same address. Restrict access and configure proxy rate limiting. Do not trust arbitrary X-Forwarded-For headers. All sessions are invalidated on restart, including a restart after a password change.
+
+### Limits and budget
+
+XLSX files must be no larger than 5 MB, with up to 5,000 rows, 50 columns and 400 characters per query. The date range is limited to 731 days, with up to 50 saved jobs and 100,000 potential daily data points per run.
+
+Duplicates are removed. Formulas in the query column are unsupported. Workbooks containing macros or external links are rejected. The original workbook is not stored. Results are exported to two worksheets. Only text queries and single-user operation are supported. Short and long queries must currently be filtered in Excel.
+
+Live mode requires `API_MAX_COST_KOPECKS` (a conservative upper estimate of the cost per request) and `API_DAILY_BUDGET_KOPECKS` (a rolling 24-hour budget), both expressed in kopecks. The request cap is the smaller of `MAX_REQUESTS_DAY` and the integer part of the budget divided by the estimated cost per request. This is an estimated safeguard, not a guarantee of actual charges. Account for pricing changes, taxes and other applications separately.
+
+### Security testing
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+These are local tests that do not require network access. Before public deployment, perform an up-to-date dependency and container audit, secret scanning, TLS and reverse proxy checks, OWASP ZAP testing and a limited live API test. Direct and known transitive dependencies are pinned for Python 3.13 on Linux. A complete audit and testing of the new Starlette version in a clean environment are required.
+
+The project has not undergone independent penetration testing. Do not use it for confidential data without a separate audit and authorization to send queries to Yandex.
+
+### Security update
+
+Twenty tests passed locally with Starlette 0.50.0. Version 1.10.0 is specified to address known CVEs, but installing and testing that version was not possible in the development environment. Do not deploy a publicly accessible instance until CI checks and the dependency audit pass.
+
+---
+
+<a id="russian"></a>
+
+## Русский
+
 Самостоятельный однопользовательский веб-инструмент для сбора исторической частотности Яндекс Wordstat из XLSX. Синтетический DEMO включён по умолчанию, реальные запросы требуют отдельного ключа владельца. Не размещайте публичный рабочий экземпляр без HTTPS, сетевой защиты и собственного аудита.
 
 ## Быстрый старт (Docker, локально)
